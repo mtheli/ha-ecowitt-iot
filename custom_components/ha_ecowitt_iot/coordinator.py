@@ -18,7 +18,14 @@ from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 from homeassistant.helpers.translation import async_get_translations
 
-from .const import CONF_MAC, DOMAIN, CONF_UPDATE_INTERVAL, DEFAULT_UPDATE_INTERVAL
+from .const import (
+    CONF_MAC,
+    CONF_SENSOR_ID_MAP,
+    DOMAIN,
+    CONF_UPDATE_INTERVAL,
+    DEFAULT_UPDATE_INTERVAL,
+    SENSOR_ID_INVALID_VALUES,
+)
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -75,6 +82,13 @@ class EcowittDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._upgrade_bound = False
         self._last_seen_value: float = 0.0
         self._last_seen_ts: float = 0.0
+
+        # 传感器身份映射（channel_key -> physical_id），跨重启持久化
+        self._sensor_id_map: dict[str, str] = dict(
+            self.config_entry.data.get(CONF_SENSOR_ID_MAP, {}) or {}
+        )
+        # 已发送过变更通知的传感器 key，避免反复告警
+        self._sensor_change_notified: set[str] = set()
 
     async def _async_update_data(self) -> dict[str, Any]:
         try:
@@ -139,7 +153,100 @@ class EcowittDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             )
         self._consecutive_failures = 0
         self._last_good_data = res
+        # 检测传感器身份变化（通道重排/更换），持久化映射并标记受影响的实体
+        await self._check_sensor_identity(res)
         return res
+
+    def _extract_sensor_id_map(self, data: dict[str, Any]) -> dict[str, str]:
+        """从返回数据中提取所有子传感器 channel_key -> physical_id 映射."""
+        result: dict[str, str] = {}
+        for key, value in data.items():
+            if not key.endswith("_id"):
+                continue
+            # 仅处理形如 "<类型>_ch<N>_id" 的通道型传感器（排除主设备如 wh69_id 等）
+            base = key[:-3]  # 去掉 "_id"
+            if "_ch" not in base:
+                continue
+            if value is None:
+                continue
+            value_str = str(value).strip()
+            if value_str.upper() in SENSOR_ID_INVALID_VALUES:
+                continue
+            result[base] = value_str
+        return result
+
+    async def _check_sensor_identity(self, data: dict[str, Any]) -> None:
+        """检测传感器通道 ID 变化；每次变化只通知用户一次（不做暂停/自动恢复）."""
+        current_map = self._extract_sensor_id_map(data)
+        if not current_map:
+            return
+
+        needs_persist = False
+        for base, new_id in current_map.items():
+            old_id = self._sensor_id_map.get(base)
+            if old_id is None:
+                # 首次出现：正常学习，记录映射
+                self._sensor_id_map[base] = new_id
+                needs_persist = True
+            elif old_id != new_id:
+                # ID 变化：更新映射，通知一次
+                self._sensor_id_map[base] = new_id
+                needs_persist = True
+                if base not in self._sensor_change_notified:
+                    self._sensor_change_notified.add(base)
+                    await self._notify_sensor_changed(base, old_id, new_id)
+
+        if needs_persist and current_map:
+            self._persist_sensor_id_map()
+
+    def _persist_sensor_id_map(self) -> None:
+        """将传感器身份映射持久化到 config entry data（跨重启保留）."""
+        try:
+            new_data = {
+                **self.config_entry.data,
+                CONF_SENSOR_ID_MAP: dict(self._sensor_id_map),
+            }
+            self.hass.config_entries.async_update_entry(self.config_entry, data=new_data)
+        except Exception:  # noqa: BLE001 - 持久化失败不应中断数据更新
+            _LOGGER.exception("Failed to persist sensor id map")
+
+    async def _notify_sensor_changed(self, base: str, old_id: str, new_id: str) -> None:
+        """发送传感器身份变更通知（含翻译）. """
+        lang = self.hass.config.language or "en"
+        host = self.config_entry.data[CONF_HOST]
+        devname = self._last_good_data.get("devname", "")
+
+        translations = await async_get_translations(
+            self.hass, lang, "component", DOMAIN, ["notifications"]
+        )
+        title_key = f"component.{DOMAIN}.notifications.sensor_changed_title"
+        title = translations.get(title_key, "Ecowitt – Sensor Changed")
+
+        message_key = f"component.{DOMAIN}.notifications.sensor_changed_message"
+        message_template = translations.get(
+            message_key,
+            "Device `{devname}` (`{host}`): sensor `{channel}` changed its ID "
+            "from `{old_id}` to `{new_id}`. This may indicate a channel reorder "
+            "or sensor replacement. Please verify your setup.",
+        )
+        message = (
+            message_template.replace("{devname}", devname)
+            .replace("{host}", host)
+            .replace("{channel}", base)
+            .replace("{old_id}", old_id)
+            .replace("{new_id}", new_id)
+        )
+
+        await self.hass.services.async_call(
+            "persistent_notification",
+            "create",
+            service_data={
+                "message": message,
+                "title": title,
+                "notification_id": f"ecowitt_sensor_changed_{base}",
+            },
+            blocking=False,
+        )
 
     def _check_device_identity(self, data: dict[str, Any]) -> str:
         """检查设备身份，纯校验无副作用，返回状态码."""

@@ -53,7 +53,7 @@ from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 from homeassistant.helpers.entity import EntityCategory
-from .const import DOMAIN
+from .const import DOMAIN, SENSOR_ID_INVALID_VALUES
 from .coordinator import EcowittDataUpdateCoordinator
 from homeassistant.helpers import device_registry as dr
 from homeassistant.util import dt as dt_util
@@ -757,6 +757,25 @@ def async_remove_old_sub_device(hass: HomeAssistant) -> None:
         _LOGGER.debug("Old sub device %s removed successfully", oldsub)
 
 
+def _is_channel_id_key(key: str) -> bool:
+    """判断是否为通道型传感器的 sensor_id 键（如 Soilmoisture_ch1_id）."""
+    return key.endswith("_id") and "_ch" in key
+
+
+def _build_sensor_id_entities(
+    coordinator: EcowittDataUpdateCoordinator, device_name: str
+) -> tuple[list["SensorIdSensor"], set[str]]:
+    """构建所有已存在 sensor_id 数据对应的诊断实体，返回 (实体列表, 已注册 key 集合)."""
+    entities: list[SensorIdSensor] = []
+    registered: set[str] = set()
+    for sid_key in coordinator.data:
+        if not _is_channel_id_key(sid_key):
+            continue
+        entities.append(SensorIdSensor(coordinator, device_name, sid_key))
+        registered.add(sid_key)
+    return entities, registered
+
+
 async def async_setup_entry(
     hass: HomeAssistant, entry: ConfigEntry, async_add_entities: AddEntitiesCallback
 ) -> None:
@@ -800,6 +819,12 @@ async def async_setup_entry(
             )
             registered_sub.add(key)
     async_add_entities(subsensors)
+
+    # 为每个通道型传感器创建独立的 sensor_id 诊断实体（方便在仪表盘/自动化中直接引用）
+    sensor_id_entities, registered_sensor_id = _build_sensor_id_entities(
+        coordinator, entry.unique_id
+    )
+    async_add_entities(sensor_id_entities)
 
     if "iot_list" in coordinator.data:
         iot_sensors: list[IotDeviceSensor] = []
@@ -866,6 +891,15 @@ async def async_setup_entry(
                         )
                     )
                     registered_sub.add(key)
+        # 动态创建新出现的 sensor_id 诊断实体
+        for sid_key in coordinator.data:
+            if not _is_channel_id_key(sid_key):
+                continue
+            if sid_key not in registered_sensor_id:
+                new_entities.append(
+                    SensorIdSensor(coordinator, entry.unique_id, sid_key)
+                )
+                registered_sensor_id.add(sid_key)
         if "iot_list" in coordinator.data:
             desc_map = {desc.key: desc for desc in IOT_SENSOR_DESCRIPTIONS}
             iot_data = coordinator.data["iot_list"]
@@ -1049,7 +1083,13 @@ class SubDevEcowittSensor(
             model=coordinator.data["ver"],
             configuration_url=f"http://{coordinator.config_entry.data[CONF_HOST]}",
         )
+        
+        # 保持旧的 unique_id 格式（基于通道号），确保向后兼容
         self._attr_unique_id = f"{device_name}_{description.key}"
+        
+        # 获取传感器唯一 ID 用于属性显示
+        self._sensor_id = coordinator.data.get(f"{description.key}_id")
+        
         self.entity_description = description
 
         # 子设备名称：设备自定义名称优先，否则用wittiot默认英文名
@@ -1127,6 +1167,12 @@ class SubDevEcowittSensor(
         last_seen = self.coordinator.data.get("_last_seen")
         if last_seen is not None:
             attrs["last_seen"] = last_seen
+        # 添加传感器唯一 ID（如果可用）
+        if (
+            self._sensor_id
+            and str(self._sensor_id).upper() not in SENSOR_ID_INVALID_VALUES
+        ):
+            attrs["sensor_id"] = self._sensor_id
         return attrs or None
 
     @property
@@ -1153,6 +1199,105 @@ class SubDevEcowittSensor(
             except (ValueError, TypeError):
                 pass
         return super().icon
+
+
+class SensorIdSensor(
+    CoordinatorEntity[EcowittDataUpdateCoordinator], SensorEntity
+):
+    """用于显示传感器物理唯一 ID 的诊断实体（独立实体，便于仪表盘/自动化引用）."""
+
+    _attr_has_entity_name = True
+    _attr_entity_category = EntityCategory.DIAGNOSTIC
+    _attr_icon = "mdi:identifier"
+
+    def __init__(
+        self,
+        coordinator: EcowittDataUpdateCoordinator,
+        device_name: str,
+        id_key: str,
+    ) -> None:
+        """Initialize."""
+        super().__init__(coordinator)
+        # id_key 形如 Soilmoisture_ch1_id
+        channel_key = id_key[:-3]  # 去掉 "_id"
+        self._id_key = id_key
+
+        # 从通道号提取传感器类型，用于命名
+        ch_match = re.match(r"(.+)_ch(\d+)$", channel_key)
+        self._base_name = ch_match.group(1) if ch_match else channel_key
+        self._my_ch = ch_match.group(2) if ch_match else ""
+
+        # 复用对应数据实体的翻译键（如 soil/temph 等），保证名称一致可识别
+        info = coordinator.api.sensor_info.get(channel_key, {})
+        self._my_tk = info.get("translation_key", "")
+
+        # 兜底名称：当 sensor_info 无该通道键（如合成键 lds_ch1）时，
+        # 从同基名的任意条目提取 dev_type（如 "CH1 Lds" -> "Lds"）
+        self._fallback_name = ""
+        if not self._my_tk:
+            for k, v in coordinator.api.sensor_info.items():
+                if k.startswith(self._base_name + "_ch"):
+                    dev_type = v.get("dev_type", "")
+                    if dev_type:
+                        # 去掉通道前缀，如 "CH1 Lds" -> "Lds"
+                        self._fallback_name = re.sub(
+                            r"^CH\d+\s*", "", dev_type
+                        )
+                        break
+            if not self._fallback_name:
+                self._fallback_name = self._base_name.upper()
+
+        self._attr_unique_id = f"{device_name}_{id_key}"
+        self.entity_description = SensorEntityDescription(
+            key=id_key,
+            name=f"{self._fallback_name or self._base_name} Sensor ID",
+        )
+
+        self._attr_device_info = DeviceInfo(
+            identifiers={(DOMAIN, f"{device_name}")},
+            manufacturer="Ecowitt",
+            name=f"{device_name}",
+            model=coordinator.data.get("ver", ""),
+            configuration_url=f"http://{coordinator.config_entry.data[CONF_HOST]}",
+        )
+
+    async def async_added_to_hass(self) -> None:
+        """实体添加到HA时，加载翻译名称并拼接通道号，避免所有通道同名."""
+        await super().async_added_to_hass()
+        base_name = self._fallback_name or self._base_name
+        if self._my_tk:
+            from homeassistant.helpers.translation import async_get_translations
+            lang = self.hass.config.language or "en"
+            translations = await async_get_translations(self.hass, lang, "entity", [DOMAIN])
+            key = f"component.{DOMAIN}.entity.sensor.{self._my_tk}.name"
+            name = translations.get(key)
+            if name:
+                base_name = name
+        # 名称 = "Soil" + " Sensor ID" + " CH1"
+        self._attr_name = f"{base_name} Sensor ID"
+        if self._my_ch:
+            self._attr_name = f"{self._attr_name} CH{self._my_ch}"
+
+    @property
+    def native_value(self) -> str | None:
+        """返回传感器物理 ID."""
+        val = self.coordinator.data.get(self._id_key)
+        if val is None:
+            return None
+        return str(val)
+
+    @property
+    def available(self) -> bool:
+        """Return if entity is available."""
+        val = self.coordinator.data.get(self._id_key)
+        if not super().available or self._id_key not in self.coordinator.data or val is None:
+            return False
+        return str(val).upper() not in SENSOR_ID_INVALID_VALUES
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any] | None:
+        """Return entity specific state attributes."""
+        return None
 
 
 class IotDeviceSensor(CoordinatorEntity, SensorEntity):
